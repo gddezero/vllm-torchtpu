@@ -20,10 +20,12 @@ TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS off process-wide. This pins:
      broadcast / all-gather and broadcast_object_list deliver the source
      values on every rank.
   2. Without it (the positive control), the same int64 broadcast reaches the
-     other ranks corrupted. When this arm stops failing, torch_tpu has fixed
-     the underlying issue and the platform workaround can go.
+     other ranks corrupted (seen on v6e-8). Where it does not corrupt (another
+     TPU generation, or a torch_tpu that fixed it), the control arm skips: the
+     fixed arm alone then cannot tell the workaround from a no-op there.
 
-Each arm is its own worker group: torch_tpu reads the variable once.
+Each arm is its own worker group: torch_tpu reads the variable once. Both arms
+import the same modules; only the fixed arm applies the workaround.
 """
 
 import argparse
@@ -37,7 +39,12 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = [pytest.mark.multichip, pytest.mark.spawns_tpu_workers]
+pytestmark = [
+    pytest.mark.omni,
+    pytest.mark.nightly,
+    pytest.mark.multichip,
+    pytest.mark.spawns_tpu_workers,
+]
 
 WORLD_SIZE = 8
 LAUNCH_TIMEOUT_SECONDS = 600
@@ -82,13 +89,13 @@ def _run_worker(result_dir: Path, arm: str) -> None:
     world = int(os.environ["WORLD_SIZE"])
     result: dict[str, object] = {"rank": rank, "arm": arm}
     try:
+        # vllm_omni first, as in a diffusion worker: importing the platform
+        # module on its own runs into vllm_omni's plugin import cycle.
+        import vllm_omni.diffusion.ipc  # noqa: F401
+
+        from vllm_torchtpu.omni.platform import OmniTpuPlatform
+
         if arm == "fixed":
-            # vllm_omni first, as in a diffusion worker: importing the platform
-            # module on its own runs into vllm_omni's plugin import cycle.
-            import vllm_omni.diffusion.ipc  # noqa: F401
-
-            from vllm_torchtpu.omni.platform import OmniTpuPlatform
-
             OmniTpuPlatform._materialize_collective_inputs()
         dist.init_process_group(backend="tpu_dist")
         torch.empty((1,), device="tpu").cpu()
@@ -118,7 +125,7 @@ def _run_worker(result_dir: Path, arm: str) -> None:
     os._exit(0)
 
 
-def _launch(result_dir: Path, arm: str) -> subprocess.CompletedProcess[str]:
+def _launch(result_dir: Path, arm: str) -> tuple[int | None, str]:
     command = [
         sys.executable,
         "-m",
@@ -133,23 +140,26 @@ def _launch(result_dir: Path, arm: str) -> subprocess.CompletedProcess[str]:
         "--result-dir",
         str(result_dir),
     ]
-    process = subprocess.Popen(
-        command,
-        cwd=Path(__file__).resolve().parents[1],
-        env=_prepare_worker_env(),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        errors="replace",
-        start_new_session=True,
-    )
-    try:
-        output, _ = process.communicate(timeout=LAUNCH_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired as exc:
-        os.killpg(process.pid, signal.SIGTERM)
-        output = exc.output or ""
-        process.wait(timeout=60)
-    return subprocess.CompletedProcess(process.args, process.returncode, output, "")
+    log_path = result_dir / "workers.log"
+    with log_path.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            command,
+            cwd=Path(__file__).resolve().parents[1],
+            env=_prepare_worker_env(),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            process.wait(timeout=LAUNCH_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+    return process.returncode, log_path.read_text(errors="replace")
 
 
 def _results(result_dir: Path) -> list[dict]:
@@ -173,32 +183,29 @@ def assert_fixed(results: list[dict]) -> None:
         assert r["object"] == {"a": 1}, r
 
 
-def assert_control_corrupts(results: list[dict]) -> None:
+def check_control_corrupts(results: list[dict]) -> None:
     errors = [r for r in results if "error" in r]
     assert not errors, f"worker failures: {errors}"
-    message = (
-        "positive control: without the workaround the int64 broadcast is "
-        "expected to corrupt on non-source ranks; if it no longer does, "
-        "torch_tpu fixed it and OmniTpuPlatform._materialize_collective_inputs "
-        "can be removed"
-    )
-    assert any(r["broadcast"] != SOURCE for r in results[1:]), (message, results)
+    if all(r["broadcast"] == SOURCE for r in results):
+        pytest.skip(
+            "positive control did not reproduce the int64 corruption here; the "
+            "fixed arm alone does not show the workaround is needed on this "
+            "TPU / torch_tpu (it was on v6e-8 with torch_tpu 0.2.0)"
+        )
 
 
 @pytest.mark.parametrize("arm", ["fixed", "control"])
 def test_diffusion_worker_collectives_under_defer_and_fuse(tmp_path, arm):
     result_dir = tmp_path / arm
     result_dir.mkdir()
-    completed = _launch(result_dir, arm)
+    returncode, output = _launch(result_dir, arm)
     results = _results(result_dir)
     print(json.dumps(results, indent=1))
-    assert completed.returncode == 0 or any("error" in r for r in results), (
-        completed.stdout[-12000:]
-    )
+    assert returncode == 0 or any("error" in r for r in results), output[-12000:]
     if arm == "fixed":
         assert_fixed(results)
     else:
-        assert_control_corrupts(results)
+        check_control_corrupts(results)
 
 
 def _main() -> None:

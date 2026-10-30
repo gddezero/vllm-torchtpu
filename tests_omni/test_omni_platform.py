@@ -326,6 +326,8 @@ def test_set_device_materializes_collective_tensors(monkeypatch, world_size, exp
     monkeypatch.setenv("MASTER_PORT", "29500")
     monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "localhost:1")
     monkeypatch.setenv("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
+    # set_device also appends a libtpu flag; restore it after the test.
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", "")
     monkeypatch.setattr(OmniTpuPlatform, "_worker_world_size", 1)
     monkeypatch.setattr(
         OmniTpuPlatform,
