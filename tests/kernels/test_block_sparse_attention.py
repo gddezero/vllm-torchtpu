@@ -29,6 +29,7 @@ from vllm_torchtpu.kernels.block_sparse_attention.kernel import (
     is_supported,
 )
 
+
 def _interpret():
     # Decided per call: touching the backend at import time claims the TPU
     # during collection (see tests/conftest.py).
@@ -42,7 +43,10 @@ def _reference(q, k, v, block_map, block_sizes, block_size, scale):
     key_valid = (np.arange(seq_len) % block_size) < np.asarray(block_sizes)[tile]
     sel = np.asarray(block_map)[:, :, tile][:, :, :, tile]  # (B, H, S, S)
     mask = jnp.asarray(sel & key_valid[None, None, None, :])
-    s = jnp.einsum("bqhd,bkhd->bhqk", q.astype(jnp.float32), k.astype(jnp.float32)) * scale
+    s = (
+        jnp.einsum("bqhd,bkhd->bhqk", q.astype(jnp.float32), k.astype(jnp.float32))
+        * scale
+    )
     has_key = mask.any(axis=-1, keepdims=True)
     p = jax.nn.softmax(jnp.where(mask, s, -1e30), axis=-1)
     p = jnp.where(mask & has_key, p, 0.0)
@@ -52,7 +56,10 @@ def _reference(q, k, v, block_map, block_sizes, block_size, scale):
 def _inputs(batch, blocks, heads, dim, block_size, seed):
     kq, kk, kv, km = jax.random.split(jax.random.PRNGKey(seed), 4)
     shape = (batch, blocks * block_size, heads, dim)
-    q, k, v = (jax.random.normal(key, shape, jnp.float32).astype(jnp.bfloat16) for key in (kq, kk, kv))
+    q, k, v = (
+        jax.random.normal(key, shape, jnp.float32).astype(jnp.bfloat16)
+        for key in (kq, kk, kv)
+    )
     block_map = np.array(jax.random.bernoulli(km, 0.35, (batch, heads, blocks, blocks)))
     return q, k, v, block_map
 
@@ -90,7 +97,9 @@ def _run(q, k, v, block_map, sizes, block_size, kb):
 )
 def test_matches_masked_reference(batch, blocks, heads, kb):
     block_size, dim = 128, 128
-    q, k, v, block_map = _inputs(batch, blocks, heads, dim, block_size, seed=blocks + 10 * heads)
+    q, k, v, block_map = _inputs(
+        batch, blocks, heads, dim, block_size, seed=blocks + 10 * heads
+    )
     sizes = np.full(blocks, block_size, np.int32)
     sizes[-1] = 37  # ragged tail
     sizes[1] = 0  # a selected tile with no valid rows
@@ -132,6 +141,10 @@ def test_block_tables_sorted_and_counted():
 def test_is_supported_vmem_envelope():
     mib = 1024 * 1024
     assert is_supported(128 * 800, 128, jnp.bfloat16, 128, 128 * mib)  # 2 x 25 MiB K/V
-    assert not is_supported(128 * 2000, 128, jnp.bfloat16, 128, 128 * mib)  # 2 x 62.5 MiB
-    assert not is_supported(128 * 4, 64, jnp.bfloat16, 128, 128 * mib)  # head_dim not lane aligned
+    assert not is_supported(
+        128 * 2000, 128, jnp.bfloat16, 128, 128 * mib
+    )  # 2 x 62.5 MiB
+    assert not is_supported(
+        128 * 4, 64, jnp.bfloat16, 128, 128 * mib
+    )  # head_dim not lane aligned
     assert not is_supported(100, 128, jnp.bfloat16, 128, 128 * mib)  # not whole tiles

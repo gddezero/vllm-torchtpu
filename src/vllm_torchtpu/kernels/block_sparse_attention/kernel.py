@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# ruff: noqa: E741
 """Explicit block-sparse attention over tile-padded sequences (Pallas TPU).
 
 The sequence is cut into tiles of ``block_size`` rows. A boolean
@@ -53,13 +54,16 @@ def kv_vmem_bytes(seq_len: int, head_dim: int, dtype) -> int:
     return 2 * seq_len * head_dim * jnp.dtype(dtype).itemsize
 
 
-def is_supported(seq_len: int, head_dim: int, dtype, block_size: int, vmem_capacity_bytes: int) -> bool:
+def is_supported(
+    seq_len: int, head_dim: int, dtype, block_size: int, vmem_capacity_bytes: int
+) -> bool:
     """Whether one head's K and V fit in VMEM next to the working set."""
     return (
         block_size % 128 == 0
         and head_dim % 128 == 0
         and seq_len % block_size == 0
-        and kv_vmem_bytes(seq_len, head_dim, dtype) + _VMEM_HEADROOM_BYTES <= vmem_capacity_bytes
+        and kv_vmem_bytes(seq_len, head_dim, dtype) + _VMEM_HEADROOM_BYTES
+        <= vmem_capacity_bytes
     )
 
 
@@ -122,10 +126,14 @@ def block_sparse_attention_bshd(
     """
     batch, seq_len, heads, dim = q.shape
     if seq_len % block_size:
-        raise ValueError(f"sequence length {seq_len} is not a multiple of block_size {block_size}")
+        raise ValueError(
+            f"sequence length {seq_len} is not a multiple of block_size {block_size}"
+        )
     blocks = seq_len // block_size
     if block_map.shape != (batch, heads, blocks, blocks):
-        raise ValueError(f"block_map shape {block_map.shape} != {(batch, heads, blocks, blocks)}")
+        raise ValueError(
+            f"block_map shape {block_map.shape} != {(batch, heads, blocks, blocks)}"
+        )
     if block_sizes.shape != (blocks,):
         raise ValueError(f"block_sizes shape {block_sizes.shape} != {(blocks,)}")
     bh = batch * heads
@@ -139,7 +147,9 @@ def block_sparse_attention_bshd(
     qh, kh, vh = to_heads(q), to_heads(k), to_heads(v)
     width = kb * block_size
 
-    def kernel(count_ref, sizes_ref, table_ref, q_ref, k_hbm, v_hbm, o_ref, k_vmem, v_vmem, sem):
+    def kernel(
+        count_ref, sizes_ref, table_ref, q_ref, k_hbm, v_hbm, o_ref, k_vmem, v_vmem, sem
+    ):
         h = pl.program_id(0)
         i = pl.program_id(1)
 
@@ -171,13 +181,17 @@ def block_sparse_attention_bshd(
                 lim = jnp.where(seg == t, valid, lim)
             kt = jnp.concatenate(ks, axis=0) if kb > 1 else ks[0]
             vt = jnp.concatenate(vs, axis=0) if kb > 1 else vs[0]
-            s = jax.lax.dot_general(qb, kt, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
+            s = jax.lax.dot_general(
+                qb, kt, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+            )
             s = jnp.where(col_in < lim, s * scale, _MASK)
             m_new = jnp.maximum(m, s.max(axis=1, keepdims=True))
             p = jnp.exp(s - m_new)
             alpha = jnp.exp(m - m_new)
             l_new = alpha * l + p.sum(axis=1, keepdims=True)
-            acc_new = alpha * acc + jnp.dot(p.astype(vt.dtype), vt, preferred_element_type=jnp.float32)
+            acc_new = alpha * acc + jnp.dot(
+                p.astype(vt.dtype), vt, preferred_element_type=jnp.float32
+            )
             return m_new, l_new, acc_new
 
         init = (
@@ -189,7 +203,9 @@ def block_sparse_attention_bshd(
         # A row whose groups were all masked keeps m at the mask value: its
         # l and acc only hold the masked placeholder terms, so return zeros.
         has_key = m > _MASK / 2
-        o_ref[0] = jnp.where(has_key, acc / jnp.where(has_key, l, 1.0), 0.0).astype(o_ref.dtype)
+        o_ref[0] = jnp.where(has_key, acc / jnp.where(has_key, l, 1.0), 0.0).astype(
+            o_ref.dtype
+        )
 
     if vmem_limit_bytes is None:
         vmem_limit_bytes = kv_vmem_bytes(seq_len, dim, q.dtype) + _VMEM_HEADROOM_BYTES
@@ -197,7 +213,11 @@ def block_sparse_attention_bshd(
         num_scalar_prefetch=2,
         grid=(bh, blocks),
         in_specs=[
-            pl.BlockSpec((1, 1, kmax), lambda h, i, *_: (h * blocks + i, 0, 0), memory_space=pltpu.SMEM),
+            pl.BlockSpec(
+                (1, 1, kmax),
+                lambda h, i, *_: (h * blocks + i, 0, 0),
+                memory_space=pltpu.SMEM,
+            ),
             pl.BlockSpec((1, block_size, dim), lambda h, i, *_: (h, i, 0)),
             pl.BlockSpec(memory_space=pl.ANY),
             pl.BlockSpec(memory_space=pl.ANY),
