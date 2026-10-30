@@ -24,12 +24,17 @@ Options:
   -t, --image-tag TAG      Tag for the built image (default: vllm-torchtpu-local)
   -s, --vllm-source DIR    Local vLLM source tree to install in editable mode
       --target TARGET      Dockerfile stage to build: prod, dev, ci, or omni (default: prod)
+      --omni-git-ref REF   For --target omni: install vllm-omni from <git URL>@<ref>
+                           instead of the pinned tag (e.g.
+                           https://github.com/<fork>/vllm-omni.git@<branch or commit>)
   -h, --help               Show this help and exit
 
 Examples:
   ./docker/build_image.sh
   ./docker/build_image.sh -t my-vllm-image
   ./docker/build_image.sh -s /path/to/vllm/source
+  ./docker/build_image.sh --target omni \
+      --omni-git-ref https://github.com/vllm-project/vllm-omni.git@<commit>
 
 The Dockerfile copies <repo>/vllm into the image. The script stages that
 directory itself (a copy of --vllm-source, or an empty directory) and removes it
@@ -43,6 +48,7 @@ IMAGE_TAG="vllm-torchtpu-local"
 VLLM_SOURCE=""
 VLLM_COMMIT_HASH=""
 TARGET="prod"
+VLLM_OMNI_GIT_REF=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -61,6 +67,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --target)
       TARGET="$2"
+      shift 2
+      ;;
+    --omni-git-ref)
+      VLLM_OMNI_GIT_REF="$2"
       shift 2
       ;;
     -h|--help)
@@ -143,6 +153,18 @@ else
   mkdir -p "${STAGED_VLLM}"
 fi
 
+if [ -n "$VLLM_OMNI_GIT_REF" ]; then
+  if [ "$TARGET" != "omni" ]; then
+    echo "--omni-git-ref only applies to --target omni (got --target $TARGET)" >&2
+    exit 1
+  fi
+  if [[ "$VLLM_OMNI_GIT_REF" != *@* ]]; then
+    echo "--omni-git-ref must be <git URL>@<ref>, got: $VLLM_OMNI_GIT_REF" >&2
+    exit 1
+  fi
+  echo "vllm-omni source: $VLLM_OMNI_GIT_REF"
+fi
+
 echo "Build Target: $TARGET"
 DOCKER_ARGS=(
   --progress=plain \
@@ -151,6 +173,7 @@ DOCKER_ARGS=(
   --target "${TARGET}" \
   --build-arg VLLM_SOURCE="${VLLM_SOURCE}" \
   --build-arg VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH}" \
+  --build-arg VLLM_OMNI_GIT_REF="${VLLM_OMNI_GIT_REF}" \
 )
 
 # Run docker build
