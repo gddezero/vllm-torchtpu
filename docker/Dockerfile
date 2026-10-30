@@ -173,28 +173,25 @@ FROM dev AS omni
 # glib; without them multi-rank diffusion workers crash at startup.
 RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
 
-# If VLLM_OMNI_GIT_REF is passed (<git URL>@<ref>, e.g. a fork branch or a
-# commit past the pinned tag), point the omni-git group at it instead of the
-# pinned vllm-omni tag. The omni extra's ==version pin is relaxed to the bare
-# name, since a ref past the tag carries a different version.
-ARG VLLM_OMNI_GIT_REF
-RUN if [ -n "$VLLM_OMNI_GIT_REF" ]; then \
-      sed -i -E \
-        -e "s|\"vllm-omni @ git\+[^\"]+\"|\"vllm-omni @ git+${VLLM_OMNI_GIT_REF}\"|" \
-        -e "s|\"vllm-omni==[^\"]+\"|\"vllm-omni\"|" \
-        pyproject.toml && \
-      grep -q "vllm-omni @ git+${VLLM_OMNI_GIT_REF}\"" pyproject.toml; \
-    fi
-
 # --group vllm keeps vLLM's source pin in this resolution, so vllm-omni cannot
 # replace it with a PyPI vllm. --group omni-git supplies the omni extra's
 # vllm-omni from its git tag until the release is on PyPI (see pyproject.toml).
+# VLLM_OMNI_GIT_REF (<https git URL>@<commit>, set by build_image.sh
+# --omni-git-ref) replaces every vllm-omni requirement with that commit through
+# an uv override, e.g. a fork or a commit past the pinned tag.
+ARG VLLM_OMNI_GIT_REF
 RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ -n "$VLLM_OMNI_GIT_REF" ]; then \
+      printf 'vllm-omni @ git+%s\n' "$VLLM_OMNI_GIT_REF" > /tmp/omni-override.txt && \
+      set -- --override /tmp/omni-override.txt; \
+    fi && \
     uv pip install --system \
       -r pyproject.toml \
       --group vllm \
       --extra omni \
-      --group omni-git
+      --group omni-git \
+      "$@" && \
+    rm -f /tmp/omni-override.txt
 
 
 # Variant 5: Production/Full Image (Production/Minimal Variant)
