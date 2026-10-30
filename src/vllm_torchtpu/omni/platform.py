@@ -173,10 +173,36 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
                 )
             cls._set_shared_slicebuilder_addresses(world_size)
             cls._offload_dense_all_to_all()
+            cls._materialize_collective_inputs()
         cls._prepare_singlehost_tpu_env(world_size)
         torch.accelerator.set_device_index(0)
         _ = torch.empty(1, device=torch.device("tpu"))
         torch.accelerator.synchronize()
+
+    @staticmethod
+    def _materialize_collective_inputs() -> None:
+        """Let torch_tpu materialize eager collective tensors in diffusion workers.
+
+        vllm-torchtpu turns TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS
+        off process-wide (sitecustomize.py) so that c10d functional
+        collectives do not break vLLM's compiled TP graphs. Diffusion workers
+        run eager under DEFER_AND_FUSE (set by
+        TpuPlatform.check_and_update_config while their VllmConfig is built),
+        and there that setting corrupts collectives: an int64 broadcast
+        reaches the other ranks as garbage, so
+        torch.distributed.broadcast_object_list fails to unpickle ("Ran out
+        of input") and int64 metadata such as shapes or token ids arrives
+        wrong. Checked on v6e-8 (tests_omni/test_omni_collectives_multichip.py);
+        bf16, f32 and int32 broadcasts were unaffected there.
+
+        torch_tpu reads the variable on first use, so setting it here, after
+        torch_tpu is imported but before the process group is created, still
+        takes effect (checked on v6e-8).
+        """
+        # TODO: Remove once torch_tpu materializes deferred collective inputs
+        # with this setting off (the control arm of the multichip test then
+        # stops corrupting).
+        os.environ["TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS"] = "true"
 
     @staticmethod
     def _offload_dense_all_to_all() -> None:
