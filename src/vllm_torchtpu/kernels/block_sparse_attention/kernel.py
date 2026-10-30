@@ -55,7 +55,7 @@ DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
 # K and V of one head live in VMEM; leave room for the q / out blocks, the
 # score block and compiler scratch.
 _VMEM_HEADROOM_BYTES = 16 * 1024 * 1024
-_LANES = 128
+LANES = 128  # tile rows and head_dim must be multiples of this
 
 
 def kv_vmem_bytes(seq_len: int, head_dim: int, dtype) -> int:
@@ -68,8 +68,8 @@ def is_supported_by_block_sparse_attention(
 ) -> bool:
     """Whether the shape is lane aligned and one head's K/V fits in VMEM."""
     return (
-        block_size % _LANES == 0
-        and head_dim % _LANES == 0
+        block_size % LANES == 0
+        and head_dim % LANES == 0
         and seq_len % block_size == 0
         and kv_vmem_bytes(seq_len, head_dim, dtype) + _VMEM_HEADROOM_BYTES
         <= vmem_capacity_bytes
@@ -107,10 +107,10 @@ def _validate(q, k, v, block_map, block_sizes, block_size, kb):
         raise ValueError(f"q, k, v dtypes differ: {q.dtype}, {k.dtype}, {v.dtype}")
     if kb < 1:
         raise ValueError(f"kb must be >= 1, got {kb}")
-    if block_size % _LANES or dim % _LANES:
+    if block_size % LANES or dim % LANES:
         raise ValueError(
             f"block_size ({block_size}) and head_dim ({dim}) must be multiples "
-            f"of {_LANES}"
+            f"of {LANES}"
         )
     if seq_len % block_size:
         raise ValueError(

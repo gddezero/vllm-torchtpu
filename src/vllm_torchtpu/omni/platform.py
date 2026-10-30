@@ -63,7 +63,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         selected = selected_backend.upper() if selected_backend is not None else None
         if selected in ("SDPA", "TPU_SDPA", "TORCH_SDPA"):
             backend = "vllm_torchtpu.omni.attention.TpuSDPABackend"
-        elif selected == "FASTVIDEO_VSA":
+        elif selected == "FASTVIDEO_VSA" and cls._serves_vsa_sparse(head_size):
             # Sparse attention stays sparse: the VSA routing runs the
             # block-sparse kernel from get_diffusion_block_sparse_attn.
             from vllm_omni.diffusion.attention.backends.registry import (
@@ -81,6 +81,36 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         return backend
 
     @classmethod
+    def _serves_vsa_sparse(cls, head_size: int) -> bool:
+        """Whether FASTVIDEO_VSA can run sparse here; otherwise keep TPU flash.
+
+        Needs a vLLM-Omni with the platform block-sparse provider (the hook
+        below is otherwise never called and the VSA impl cannot run on TPU)
+        and a lane-aligned head size for the kernel.
+        """
+        from vllm_omni.diffusion.attention.ops import block_sparse
+
+        from vllm_torchtpu.kernels.block_sparse_attention.kernel import LANES
+
+        if not hasattr(OmniPlatform, "get_diffusion_block_sparse_attn") or not hasattr(
+            block_sparse, "_platform_block_sparse_kernel"
+        ):
+            logger.warning_once(
+                "This vLLM-Omni has no platform block-sparse provider; FASTVIDEO_VSA "
+                "runs as dense flash attention on TPU."
+            )
+            return False
+        if head_size % LANES:
+            logger.warning_once(
+                "FASTVIDEO_VSA head size %d is not a multiple of %d; it runs as "
+                "dense flash attention on TPU.",
+                head_size,
+                LANES,
+            )
+            return False
+        return True
+
+    @classmethod
     def get_diffusion_block_sparse_attn(
         cls,
         block_size: int,
@@ -92,10 +122,17 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         Sequences whose per-head K/V exceeds VMEM are rejected by the kernel
         with an explicit error (is_supported_by_block_sparse_attention).
         """
-        if dtype != torch.bfloat16 or block_size % 128 or head_size % 128:
-            return None
-        from vllm_torchtpu.omni.attention import block_sparse_attention
+        from vllm_torchtpu.kernels.block_sparse_attention.kernel import LANES
 
+        if dtype != torch.bfloat16 or block_size % LANES or head_size % LANES:
+            return None
+        from vllm_torchtpu.omni.attention import (
+            block_sparse_attention,
+            build_block_sparse_attention_op,
+        )
+
+        # Register the custom op here, outside any traced region.
+        build_block_sparse_attention_op()
         return block_sparse_attention
 
     @classmethod

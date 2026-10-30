@@ -27,13 +27,16 @@ from functools import cache as run_once
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 
 from vllm_torchtpu.kernels.block_sparse_attention.kernel import (
     block_sparse_attention_bshd,
+    is_supported_by_block_sparse_attention,
 )
+from vllm_torchtpu.kernels.diffusion_attention.block_sizes import detect_spec
 from vllm_torchtpu.kernels.diffusion_attention.kernel import flash_attention_bshd
 from vllm_torchtpu.logger import init_logger
 
@@ -82,7 +85,7 @@ def _flash_attention_op():
 
 
 @run_once
-def _block_sparse_attention_op():
+def build_block_sparse_attention_op():
     """Builds the torch custom op wrapping the block-sparse kernel (once)."""
 
     def diffusion_block_sparse_attention(
@@ -121,12 +124,26 @@ def block_sparse_attention(
     ``[B, H, blocks, blocks]`` and int32 ``block_sizes [blocks]``; returns a
     tensor shaped like ``query``.
     """
-    return _block_sparse_attention_op()(
+    if block_sizes.dtype != torch.int32:
+        raise ValueError(f"block_sizes must be int32, got {block_sizes.dtype}")
+    seq_len, head_dim = query.shape[1], query.shape[-1]
+    vmem = detect_spec().vmem_bytes
+    dtype = jnp.dtype(str(query.dtype).removeprefix("torch."))
+    if not is_supported_by_block_sparse_attention(
+        seq_len, head_dim, dtype, block_size, vmem
+    ):
+        raise ValueError(
+            f"block-sparse attention keeps one head's K/V in VMEM; {seq_len} tokens "
+            f"x head_dim {head_dim} does not fit in {vmem // (1 << 20)} MiB. "
+            "Shorten the request (fewer frames or a smaller size) or raise the "
+            "sequence-parallel degree so each rank holds fewer tokens."
+        )
+    return build_block_sparse_attention_op()(
         query,
         key,
         value,
         block_map,
-        block_sizes.to(torch.int32),
+        block_sizes,
         float(softmax_scale),
         int(block_size),
     )
