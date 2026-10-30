@@ -927,3 +927,36 @@ def test_ltx2_split_rope_tables_reused_for_coords_views(ltx2, table_syncs, infer
         fresh = call(coords[:, 0:1, :])
         assert len(table_syncs) == syncs + 1
         assert not torch.equal(fresh[0], stale[0])
+
+
+def test_fastvideo_vsa_keeps_the_sparse_backend():
+    with patch("vllm_torchtpu.omni.patches.apply_omni_model_specific_patches"):
+        assert OmniTpuPlatform.get_diffusion_attn_backend_cls("FASTVIDEO_VSA", 128) == (
+            "vllm_omni.diffusion.attention.backends.fastvideo_vsa.FastVideoVSABackend"
+        )
+
+
+def test_block_sparse_attention_hook(monkeypatch):
+    from vllm_torchtpu.omni import attention
+
+    hook = OmniTpuPlatform.get_diffusion_block_sparse_attn
+    assert hook(128, torch.bfloat16, 128) is attention.block_sparse_attention
+    assert hook(64, torch.bfloat16, 128) is None  # tile not lane aligned
+    assert hook(128, torch.float16, 128) is None
+    assert hook(128, torch.bfloat16, 64) is None
+
+    calls = []
+
+    def fake_op(q, k, v, block_map, block_sizes, scale, block_size):
+        calls.append((block_map, block_sizes.dtype, scale, block_size))
+        return q.clone()
+
+    monkeypatch.setattr(attention, "_block_sparse_attention_op", lambda: fake_op)
+    q = torch.randn(1, 256, 2, 128, dtype=torch.bfloat16)
+    block_map = torch.ones(1, 2, 2, 2, dtype=torch.bool)
+    sizes = torch.tensor([128, 64], dtype=torch.int64)
+    out = attention.block_sparse_attention(
+        q, q, q, block_map, sizes, 128**-0.5, block_size=128
+    )
+    assert torch.equal(out, q)
+    assert calls == [(block_map, torch.int32, 128**-0.5, 128)]

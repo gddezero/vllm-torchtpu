@@ -14,6 +14,7 @@
 """TPU platform plugin for vllm-omni."""
 
 import os
+from collections.abc import Callable
 
 import torch
 from torch_tpu._internal.utils import hardware
@@ -59,12 +60,17 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
 
         apply_omni_model_specific_patches()
-        if selected_backend is not None and selected_backend.upper() in (
-            "SDPA",
-            "TPU_SDPA",
-            "TORCH_SDPA",
-        ):
+        selected = selected_backend.upper() if selected_backend is not None else None
+        if selected in ("SDPA", "TPU_SDPA", "TORCH_SDPA"):
             backend = "vllm_torchtpu.omni.attention.TpuSDPABackend"
+        elif selected == "FASTVIDEO_VSA":
+            # Sparse attention stays sparse: the VSA routing runs the
+            # block-sparse kernel from get_diffusion_block_sparse_attn.
+            from vllm_omni.diffusion.attention.backends.registry import (
+                DiffusionAttentionBackendEnum,
+            )
+
+            backend = DiffusionAttentionBackendEnum.FASTVIDEO_VSA.get_path()
         else:
             backend = "vllm_torchtpu.omni.attention.TpuFlashAttentionBackend"
         logger.info_once(
@@ -73,6 +79,24 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
             selected_backend,
         )
         return backend
+
+    @classmethod
+    def get_diffusion_block_sparse_attn(
+        cls,
+        block_size: int,
+        dtype: torch.dtype,
+        head_size: int,
+    ) -> Callable[..., torch.Tensor] | None:
+        """The Pallas block-sparse kernel for bf16, lane-aligned tiles/heads.
+
+        Sequences whose per-head K/V exceeds VMEM are rejected by the kernel
+        with an explicit error (is_supported_by_block_sparse_attention).
+        """
+        if dtype != torch.bfloat16 or block_size % 128 or head_size % 128:
+            return None
+        from vllm_torchtpu.omni.attention import block_sparse_attention
+
+        return block_sparse_attention
 
     @classmethod
     def supports_torch_inductor(cls) -> bool:
