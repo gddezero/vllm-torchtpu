@@ -17,16 +17,26 @@
 bf16 attention through a Pallas flash kernel tuned for diffusion
 sequence lengths. Masked, causal, or non-bf16 calls fall back with a
 one-time warning to ``TpuSDPAImpl`` (PyTorch SDPA).
+
+``block_sparse_attention`` is the explicit block-sparse kernel vLLM-Omni's
+VSA routing calls through the platform provider
+(``OmniTpuPlatform.get_diffusion_block_sparse_attn``).
 """
 
 from functools import cache as run_once
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 
+from vllm_torchtpu.kernels.block_sparse_attention.kernel import (
+    block_sparse_attention_bshd,
+    is_supported_by_block_sparse_attention,
+)
+from vllm_torchtpu.kernels.diffusion_attention.block_sizes import detect_spec
 from vllm_torchtpu.kernels.diffusion_attention.kernel import flash_attention_bshd
 from vllm_torchtpu.logger import init_logger
 
@@ -72,6 +82,71 @@ def _flash_attention_op():
     op = pallas.jax_op("pallas::diffusion_flash_attention", diffusion_flash_attention)
     op.register_fake(lambda q, k, v, scale: q.new_empty((*q.shape[:3], v.shape[-1])))
     return op
+
+
+@run_once
+def build_block_sparse_attention_op():
+    """Builds the torch custom op wrapping the block-sparse kernel (once)."""
+
+    def diffusion_block_sparse_attention(
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        block_map: jax.Array,
+        block_sizes: jax.Array,
+        scale: float,
+        block_size: int,
+    ) -> jax.Array:
+        return block_sparse_attention_bshd(
+            q, k, v, block_map, block_sizes, scale=scale, block_size=block_size
+        )
+
+    op = pallas.jax_op(
+        "pallas::diffusion_block_sparse_attention", diffusion_block_sparse_attention
+    )
+    op.register_fake(lambda q, *args: torch.empty_like(q))
+    return op
+
+
+def block_sparse_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    block_map: torch.Tensor,
+    block_sizes: torch.Tensor,
+    softmax_scale: float,
+    *,
+    block_size: int,
+) -> torch.Tensor:
+    """vLLM-Omni platform block-sparse kernel contract on TPU tensors.
+
+    Tile-padded BSHD ``query``/``key``/``value``, boolean ``block_map``
+    ``[B, H, blocks, blocks]`` and int32 ``block_sizes [blocks]``; returns a
+    tensor shaped like ``query``.
+    """
+    if block_sizes.dtype != torch.int32:
+        raise ValueError(f"block_sizes must be int32, got {block_sizes.dtype}")
+    seq_len, head_dim = query.shape[1], query.shape[-1]
+    vmem = detect_spec().vmem_bytes
+    dtype = jnp.dtype(str(query.dtype).removeprefix("torch."))
+    if not is_supported_by_block_sparse_attention(
+        seq_len, head_dim, dtype, block_size, vmem
+    ):
+        raise ValueError(
+            f"block-sparse attention keeps one head's K/V in VMEM; {seq_len} tokens "
+            f"x head_dim {head_dim} does not fit in {vmem // (1 << 20)} MiB. "
+            "Shorten the request (fewer frames or a smaller size) or raise the "
+            "sequence-parallel degree so each rank holds fewer tokens."
+        )
+    return build_block_sparse_attention_op()(
+        query,
+        key,
+        value,
+        block_map,
+        block_sizes,
+        float(softmax_scale),
+        int(block_size),
+    )
 
 
 class TpuFlashAttentionImpl(TpuSDPAImpl):

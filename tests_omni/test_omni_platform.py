@@ -927,3 +927,118 @@ def test_ltx2_split_rope_tables_reused_for_coords_views(ltx2, table_syncs, infer
         fresh = call(coords[:, 0:1, :])
         assert len(table_syncs) == syncs + 1
         assert not torch.equal(fresh[0], stale[0])
+
+
+def test_fastvideo_vsa_keeps_the_sparse_backend(monkeypatch):
+    # A vLLM-Omni with the platform block-sparse provider.
+    from vllm_omni.diffusion.attention.ops import block_sparse
+    from vllm_omni.platforms.interface import OmniPlatform
+
+    if not hasattr(OmniPlatform, "get_diffusion_block_sparse_attn"):
+        monkeypatch.setattr(
+            OmniPlatform,
+            "get_diffusion_block_sparse_attn",
+            classmethod(lambda cls, *a: None),
+            raising=False,
+        )
+    if not hasattr(block_sparse, "_platform_block_sparse_kernel"):
+        monkeypatch.setattr(
+            block_sparse,
+            "_platform_block_sparse_kernel",
+            lambda *a: None,
+            raising=False,
+        )
+    with patch("vllm_torchtpu.omni.patches.apply_omni_model_specific_patches"):
+        assert OmniTpuPlatform.get_diffusion_attn_backend_cls("FASTVIDEO_VSA", 128) == (
+            "vllm_omni.diffusion.attention.backends.fastvideo_vsa.FastVideoVSABackend"
+        )
+        # Heads the kernel cannot take keep the dense TPU flash backend.
+        assert (
+            OmniTpuPlatform.get_diffusion_attn_backend_cls("FASTVIDEO_VSA", 64)
+            == "vllm_torchtpu.omni.attention.TpuFlashAttentionBackend"
+        )
+
+
+def test_fastvideo_vsa_without_platform_provider_stays_dense(monkeypatch):
+    from vllm_omni.platforms.interface import OmniPlatform
+
+    monkeypatch.delattr(OmniPlatform, "get_diffusion_block_sparse_attn", raising=False)
+    with patch("vllm_torchtpu.omni.patches.apply_omni_model_specific_patches"):
+        assert (
+            OmniTpuPlatform.get_diffusion_attn_backend_cls("FASTVIDEO_VSA", 128)
+            == "vllm_torchtpu.omni.attention.TpuFlashAttentionBackend"
+        )
+
+
+def test_block_sparse_attention_hook(monkeypatch):
+    from vllm_torchtpu.omni import attention
+
+    built = []
+    monkeypatch.setattr(
+        attention, "build_block_sparse_attention_op", lambda: built.append(1)
+    )
+    hook = OmniTpuPlatform.get_diffusion_block_sparse_attn
+    assert hook(128, torch.bfloat16, 128) is attention.block_sparse_attention
+    assert built, "the op is registered when the hook hands out the kernel"
+    assert hook(64, torch.bfloat16, 128) is None  # tile not lane aligned
+    assert hook(128, torch.float16, 128) is None
+    assert hook(128, torch.bfloat16, 64) is None
+
+    calls = []
+
+    def fake_op(q, k, v, block_map, block_sizes, scale, block_size):
+        calls.append((block_map, block_sizes.dtype, scale, block_size))
+        return q.clone()
+
+    monkeypatch.setattr(attention, "build_block_sparse_attention_op", lambda: fake_op)
+    q = torch.randn(1, 256, 2, 128, dtype=torch.bfloat16)
+    block_map = torch.ones(1, 2, 2, 2, dtype=torch.bool)
+    sizes = torch.tensor([128, 64], dtype=torch.int32)
+    out = attention.block_sparse_attention(
+        q, q, q, block_map, sizes, 128**-0.5, block_size=128
+    )
+    assert torch.equal(out, q)
+    assert calls == [(block_map, torch.int32, 128**-0.5, 128)]
+    with pytest.raises(ValueError, match="int32"):
+        attention.block_sparse_attention(
+            q, q, q, block_map, sizes.long(), 128**-0.5, block_size=128
+        )
+    long_q = torch.empty(1, 128 * 4000, 2, 128, dtype=torch.bfloat16, device="meta")
+    with pytest.raises(ValueError, match="does not fit"):
+        attention.block_sparse_attention(
+            long_q,
+            long_q,
+            long_q,
+            torch.ones(1, 2, 4000, 4000, dtype=torch.bool, device="meta"),
+            torch.full((4000,), 128, dtype=torch.int32, device="meta"),
+            128**-0.5,
+            block_size=128,
+        )
+
+
+def test_block_sparse_attention_op_on_tpu():
+    """The real jax_op bridge against a dense masked reference."""
+    try:
+        device = torch.device("tpu")
+        torch.zeros(1, device=device)
+    except Exception:
+        pytest.skip("needs a TPU")
+    from vllm_torchtpu.omni import attention
+
+    torch.manual_seed(0)
+    blocks, heads, dim = 3, 2, 128
+    q, k, v = (torch.randn(1, blocks * 128, heads, dim) for _ in range(3))
+    q, k, v = (x.to(torch.bfloat16) for x in (q, k, v))
+    block_map = torch.tensor([[[1, 0, 1], [0, 1, 0], [1, 1, 1]]] * heads)[None].bool()
+    sizes = torch.tensor([128, 128, 50], dtype=torch.int32)
+    out = attention.block_sparse_attention(
+        *(x.to(device) for x in (q, k, v, block_map, sizes)),
+        dim**-0.5,
+        block_size=128,
+    ).cpu()
+    mask = block_map.repeat_interleave(128, -1).repeat_interleave(128, -2)
+    mask &= (torch.arange(128)[None] < sizes[:, None]).flatten().view(1, 1, 1, -1)
+    ref = torch.nn.functional.scaled_dot_product_attention(
+        *(x.transpose(1, 2).float() for x in (q, k, v)), attn_mask=mask
+    ).transpose(1, 2)
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)

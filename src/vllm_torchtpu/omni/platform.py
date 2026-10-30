@@ -14,6 +14,7 @@
 """TPU platform plugin for vllm-omni."""
 
 import os
+from collections.abc import Callable
 
 import torch
 from torch_tpu._internal.utils import hardware
@@ -59,12 +60,17 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
 
         apply_omni_model_specific_patches()
-        if selected_backend is not None and selected_backend.upper() in (
-            "SDPA",
-            "TPU_SDPA",
-            "TORCH_SDPA",
-        ):
+        selected = selected_backend.upper() if selected_backend is not None else None
+        if selected in ("SDPA", "TPU_SDPA", "TORCH_SDPA"):
             backend = "vllm_torchtpu.omni.attention.TpuSDPABackend"
+        elif selected == "FASTVIDEO_VSA" and cls._serves_vsa_sparse(head_size):
+            # Sparse attention stays sparse: the VSA routing runs the
+            # block-sparse kernel from get_diffusion_block_sparse_attn.
+            from vllm_omni.diffusion.attention.backends.registry import (
+                DiffusionAttentionBackendEnum,
+            )
+
+            backend = DiffusionAttentionBackendEnum.FASTVIDEO_VSA.get_path()
         else:
             backend = "vllm_torchtpu.omni.attention.TpuFlashAttentionBackend"
         logger.info_once(
@@ -73,6 +79,61 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
             selected_backend,
         )
         return backend
+
+    @classmethod
+    def _serves_vsa_sparse(cls, head_size: int) -> bool:
+        """Whether FASTVIDEO_VSA can run sparse here; otherwise keep TPU flash.
+
+        Needs a vLLM-Omni with the platform block-sparse provider (the hook
+        below is otherwise never called and the VSA impl cannot run on TPU)
+        and a lane-aligned head size for the kernel.
+        """
+        from vllm_omni.diffusion.attention.ops import block_sparse
+
+        from vllm_torchtpu.kernels.block_sparse_attention.kernel import LANES
+
+        if not hasattr(OmniPlatform, "get_diffusion_block_sparse_attn") or not hasattr(
+            block_sparse, "_platform_block_sparse_kernel"
+        ):
+            logger.warning_once(
+                "This vLLM-Omni has no platform block-sparse provider; FASTVIDEO_VSA "
+                "runs as dense flash attention on TPU."
+            )
+            return False
+        if head_size % LANES:
+            logger.warning_once(
+                "FASTVIDEO_VSA head size %d is not a multiple of %d; it runs as "
+                "dense flash attention on TPU.",
+                head_size,
+                LANES,
+            )
+            return False
+        return True
+
+    @classmethod
+    def get_diffusion_block_sparse_attn(
+        cls,
+        block_size: int,
+        dtype: torch.dtype,
+        head_size: int,
+    ) -> Callable[..., torch.Tensor] | None:
+        """The Pallas block-sparse kernel for bf16, lane-aligned tiles/heads.
+
+        Sequences whose per-head K/V exceeds VMEM are rejected by the kernel
+        with an explicit error (is_supported_by_block_sparse_attention).
+        """
+        from vllm_torchtpu.kernels.block_sparse_attention.kernel import LANES
+
+        if dtype != torch.bfloat16 or block_size % LANES or head_size % LANES:
+            return None
+        from vllm_torchtpu.omni.attention import (
+            block_sparse_attention,
+            build_block_sparse_attention_op,
+        )
+
+        # Register the custom op here, outside any traced region.
+        build_block_sparse_attention_op()
+        return block_sparse_attention
 
     @classmethod
     def supports_torch_inductor(cls) -> bool:
