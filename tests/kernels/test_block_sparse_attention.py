@@ -26,7 +26,7 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.block_sparse_attention.kernel import (
     block_sparse_attention_bshd,
     block_tables,
-    is_supported,
+    is_supported_by_block_sparse_attention,
 )
 
 
@@ -128,23 +128,68 @@ def test_detects_a_flipped_block():
     assert _rel_err(out, ref) > 0.1
 
 
+def test_padding_contents_never_reach_the_output():
+    """Non-finite values in padded key/value rows must not leak (masked p and V)."""
+    block_size, dim, blocks, heads = 128, 128, 4, 2
+    q, k, v, block_map = _inputs(1, blocks, heads, dim, block_size, seed=3)
+    sizes = np.array([128, 37, 128, 0], np.int32)
+    k = k.at[0, 128 + 37 : 256].set(jnp.inf)
+    v = v.at[0, 128 + 37 : 256].set(jnp.nan)
+    v = v.at[0, 384:].set(jnp.inf)  # an empty tile
+    block_map[:] = False
+    block_map[0, :, :, 1] = True  # every query tile reads the ragged tile
+    block_map[0, 0, 1, 3] = True  # ... and one also the empty tile
+    block_map[0, 1, 2, [3, 0]] = True  # kb=1: an all-masked group first
+    for kb in (1, 4):
+        out = _run(q, k, v, block_map, sizes, block_size, kb)
+        clean_k = k.at[0, 128 + 37 : 256].set(0.0)
+        clean_v = v.at[0, 128 + 37 : 256].set(0.0).at[0, 384:].set(0.0)
+        ref = _reference(q, clean_k, clean_v, block_map, sizes, block_size, dim**-0.5)
+        assert _rel_err(out, ref) < 2e-2
+
+
+@pytest.mark.parametrize(
+    "case,match",
+    [
+        ("k_shape", "share the"),
+        ("dtype", "dtypes differ"),
+        ("kb", "kb must be"),
+        ("head_dim", "multiples of 128"),
+    ],
+)
+def test_rejects_invalid_inputs(case, match):
+    q = jnp.zeros((1, 256, 2, 128), jnp.bfloat16)
+    k = v = q
+    block_map = jnp.ones((1, 2, 2, 2), bool)
+    sizes = jnp.full((2,), 128, jnp.int32)
+    kb = 4
+    if case == "k_shape":
+        k = jnp.zeros((1, 128, 4, 128), jnp.bfloat16)
+    elif case == "dtype":
+        v = q.astype(jnp.float32)
+    elif case == "kb":
+        kb = 0
+    else:
+        q = k = v = jnp.zeros((1, 256, 2, 64), jnp.bfloat16)
+    with pytest.raises(ValueError, match=match):
+        block_sparse_attention_bshd(
+            q, k, v, block_map, sizes, scale=0.1, kb=kb, interpret=_interpret()
+        )
+
+
 def test_block_tables_sorted_and_counted():
     block_map = np.zeros((1, 1, 2, 5), bool)
     block_map[0, 0, 0, [4, 1, 3]] = True
-    table, count = block_tables(jnp.asarray(block_map), kb=4)
-    assert table.shape == (2, 1, 8)
-    np.testing.assert_array_equal(np.asarray(count), [3, 0])
-    np.testing.assert_array_equal(np.asarray(table[0, 0]), [1, 3, 4, 0, 0, 0, 0, 0])
+    table = block_tables(jnp.asarray(block_map), kb=4)
+    assert table.shape == (2, 1, 9)
+    np.testing.assert_array_equal(np.asarray(table[0, 0]), [3, 1, 3, 4, 0, 0, 0, 0, 0])
     np.testing.assert_array_equal(np.asarray(table[1, 0]), 0)
 
 
-def test_is_supported_vmem_envelope():
+def test_vmem_envelope():
     mib = 1024 * 1024
-    assert is_supported(128 * 800, 128, jnp.bfloat16, 128, 128 * mib)  # 2 x 25 MiB K/V
-    assert not is_supported(
-        128 * 2000, 128, jnp.bfloat16, 128, 128 * mib
-    )  # 2 x 62.5 MiB
-    assert not is_supported(
-        128 * 4, 64, jnp.bfloat16, 128, 128 * mib
-    )  # head_dim not lane aligned
-    assert not is_supported(100, 128, jnp.bfloat16, 128, 128 * mib)  # not whole tiles
+    check = is_supported_by_block_sparse_attention
+    assert check(128 * 800, 128, jnp.bfloat16, 128, 128 * mib)  # 2 x 25 MiB K/V
+    assert not check(128 * 2000, 128, jnp.bfloat16, 128, 128 * mib)  # 2 x 62.5 MiB
+    assert not check(128 * 4, 64, jnp.bfloat16, 128, 128 * mib)  # head_dim not aligned
+    assert not check(100, 128, jnp.bfloat16, 128, 128 * mib)  # not whole tiles
