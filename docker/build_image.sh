@@ -24,12 +24,19 @@ Options:
   -t, --image-tag TAG      Tag for the built image (default: vllm-torchtpu-local)
   -s, --vllm-source DIR    Local vLLM source tree to install in editable mode
       --target TARGET      Dockerfile stage to build: prod, dev, ci, or omni (default: prod)
+      --omni-git-ref REF   For --target omni: install vllm-omni from
+                           <https git URL>@<branch, tag or commit> instead of the
+                           pinned tag. Branches and tags are resolved to a commit
+                           with git ls-remote, so the build records what it got
+                           and a moved branch is not served from the layer cache.
   -h, --help               Show this help and exit
 
 Examples:
   ./docker/build_image.sh
   ./docker/build_image.sh -t my-vllm-image
   ./docker/build_image.sh -s /path/to/vllm/source
+  ./docker/build_image.sh --target omni \
+      --omni-git-ref https://github.com/vllm-project/vllm-omni.git@main
 
 The Dockerfile copies <repo>/vllm into the image. The script stages that
 directory itself (a copy of --vllm-source, or an empty directory) and removes it
@@ -43,6 +50,7 @@ IMAGE_TAG="vllm-torchtpu-local"
 VLLM_SOURCE=""
 VLLM_COMMIT_HASH=""
 TARGET="prod"
+VLLM_OMNI_GIT_REF=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -63,6 +71,14 @@ while [[ $# -gt 0 ]]; do
       TARGET="$2"
       shift 2
       ;;
+    --omni-git-ref)
+      if [ $# -lt 2 ] || [ -z "$2" ]; then
+        echo "--omni-git-ref needs a value: <https git URL>@<ref>" >&2
+        exit 1
+      fi
+      VLLM_OMNI_GIT_REF="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -74,6 +90,42 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Validate --omni-git-ref before any staging work, and pin it to a commit.
+if [ -n "$VLLM_OMNI_GIT_REF" ]; then
+  if [ "$TARGET" != "omni" ]; then
+    echo "--omni-git-ref only applies to --target omni (got --target $TARGET)" >&2
+    exit 1
+  fi
+  OMNI_URL="${VLLM_OMNI_GIT_REF%@*}"
+  OMNI_REF="${VLLM_OMNI_GIT_REF##*@}"
+  if [[ "$VLLM_OMNI_GIT_REF" != *@* || -z "$OMNI_REF" ]]; then
+    echo "--omni-git-ref must be <https git URL>@<ref>, got: $VLLM_OMNI_GIT_REF" >&2
+    exit 1
+  fi
+  if [[ "$OMNI_URL" != https://* ]]; then
+    echo "--omni-git-ref URL must be https:// (the build has no SSH credentials), got: $OMNI_URL" >&2
+    exit 1
+  fi
+  OMNI_HOST="${OMNI_URL#https://}"
+  OMNI_HOST="${OMNI_HOST%%/*}"
+  if [[ "$OMNI_HOST" == *@* ]]; then
+    echo "--omni-git-ref URL must not carry credentials; they would be recorded in the image history" >&2
+    exit 1
+  fi
+  if [[ ! "$OMNI_REF" =~ ^[0-9a-f]{40}$ ]]; then
+    # An annotated tag lists the tag object first and its commit as <tag>^{};
+    # prefer the peeled line so the pin is always a commit.
+    OMNI_SHA="$(git ls-remote "$OMNI_URL" "refs/heads/$OMNI_REF" "refs/tags/$OMNI_REF" "refs/tags/$OMNI_REF^{}" |
+      awk '$2 ~ /\^\{\}$/ {peeled = $1} NR == 1 {first = $1} END {print (peeled != "" ? peeled : first)}')"
+    if [ -z "$OMNI_SHA" ]; then
+      echo "--omni-git-ref: no branch or tag named '$OMNI_REF' in $OMNI_URL (pass a full 40-character commit to skip the lookup)" >&2
+      exit 1
+    fi
+    echo "Resolved vllm-omni ref $OMNI_REF -> $OMNI_SHA"
+    VLLM_OMNI_GIT_REF="$OMNI_URL@$OMNI_SHA"
+  fi
+fi
 
 echo "===> Building vllm-torchtpu image..."
 echo "Image Tag: $IMAGE_TAG"
@@ -143,6 +195,10 @@ else
   mkdir -p "${STAGED_VLLM}"
 fi
 
+if [ -n "$VLLM_OMNI_GIT_REF" ]; then
+  echo "vllm-omni source: $VLLM_OMNI_GIT_REF"
+fi
+
 echo "Build Target: $TARGET"
 DOCKER_ARGS=(
   --progress=plain \
@@ -151,6 +207,7 @@ DOCKER_ARGS=(
   --target "${TARGET}" \
   --build-arg VLLM_SOURCE="${VLLM_SOURCE}" \
   --build-arg VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH}" \
+  --build-arg VLLM_OMNI_GIT_REF="${VLLM_OMNI_GIT_REF}" \
 )
 
 # Run docker build

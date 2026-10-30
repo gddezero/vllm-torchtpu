@@ -210,6 +210,8 @@ pip install \
 | `--extra omni` | Installs `vllm-omni` for multimodal diffusion models (e.g., FLUX, Wan2.2). |
 | `--group omni-git` | Installs `vllm-omni` 0.32.0rc1 from its git tag for `--extra omni`, until that release is on PyPI. |
 
+To build the omni image against a different vllm-omni (a commit past the tag, or a fork), pass `./docker/build_image.sh --target omni --omni-git-ref <https git URL>@<branch, tag or commit>`. Branches and tags are resolved to a commit before the build; the commit replaces every `vllm-omni` requirement through a uv override. The installed package metadata of `vllm-torchtpu` still declares the pinned `vllm-omni` version, so `pip check` reports the mismatch.
+
 ---
 
 ## Verify Installation
