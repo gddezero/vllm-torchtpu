@@ -318,6 +318,26 @@ def test_dist_backend_after_world_size_pop(monkeypatch):
     assert OmniTpuPlatform().dist_backend == "tpu_dist"
 
 
+def test_set_device_sets_fp32_matmul_precision_highest(monkeypatch):
+    # float32 matmuls must run in full precision, as on CUDA (torch_tpu
+    # defaults to a single bf16 pass).
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    monkeypatch.setattr(
+        OmniTpuPlatform,
+        "_prepare_singlehost_tpu_env",
+        staticmethod(lambda world_size: None),
+    )
+    monkeypatch.setattr(torch, "accelerator", MagicMock(), raising=False)
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("medium")
+    try:
+        with patch("torch.empty"), patch("torch.device"):
+            OmniTpuPlatform.set_device(None)
+        assert torch.get_float32_matmul_precision() == "highest"
+    finally:
+        torch.set_float32_matmul_precision(previous)
+
+
 @pytest.mark.parametrize("chips, warns", [(None, False), ("0,1", False), ("1,2", True)])
 def test_set_device_warns_on_pinned_multi_rank_stage(monkeypatch, chips, warns):
     # Ranks bind chips 0..N-1 by local rank, so a stage pinned to other chips
