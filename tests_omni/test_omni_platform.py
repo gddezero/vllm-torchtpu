@@ -548,20 +548,7 @@ def test_wan_self_attention_patch_falls_back_on_f32():
     )
 
 
-def test_sdpa_fallback_routes_to_tpu_sdpa(monkeypatch):
-    # Upstream AttentionImpl.forward raises on out-of-tree platforms; after
-    # the patch, sdpa_fallback (a plain SDPAImpl) runs PyTorch SDPA.
-    monkeypatch.setattr(SDPAImpl, "forward", _UPSTREAM_SDPA_FORWARD)
-    fallback = SDPAImpl(num_heads=2, head_size=8, softmax_scale=0.3)
-    torch.manual_seed(0)
-    q, k, v = (torch.randn(2, 5, 2, 8) for _ in range(3))
-    with pytest.raises(NotImplementedError):
-        fallback.forward(q, k, v)
-
-    _patch_sdpa_fallback_dispatch()
-    assert getattr(SDPAImpl.forward, _SDPA_FALLBACK_PATCHED, False)
-    assert SDPAImpl.forward is TpuSDPAImpl.forward
-
+def _assert_sdpa_matches_reference(fallback, q, k, v):
     keep = torch.tensor([[1, 1, 1, 1, 1], [1, 1, 1, 0, 0]])
     for mask in (None, keep.bool(), keep.float()):
         meta = None if mask is None else SimpleNamespace(attn_mask=mask)
@@ -573,12 +560,46 @@ def test_sdpa_fallback_routes_to_tpu_sdpa(monkeypatch):
             fallback.forward(q, k, v, meta), want.float(), rtol=1e-5, atol=1e-5
         )
 
+
+def test_sdpa_fallback_routes_to_tpu_sdpa(monkeypatch):
+    # The pinned vLLM-Omni has no SDPAImpl.forward_oot: AttentionImpl.forward
+    # raises on out-of-tree platforms; after the patch, sdpa_fallback (a plain
+    # SDPAImpl) runs PyTorch SDPA.
+    monkeypatch.setattr(SDPAImpl, "forward", _UPSTREAM_SDPA_FORWARD)
+    if "forward_oot" in SDPAImpl.__dict__:
+        monkeypatch.delattr(SDPAImpl, "forward_oot")
+    fallback = SDPAImpl(num_heads=2, head_size=8, softmax_scale=0.3)
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(2, 5, 2, 8) for _ in range(3))
+    with pytest.raises(NotImplementedError):
+        fallback.forward(q, k, v)
+
+    _patch_sdpa_fallback_dispatch()
+    assert getattr(SDPAImpl.forward, _SDPA_FALLBACK_PATCHED, False)
+    assert SDPAImpl.forward is TpuSDPAImpl.forward
+    _assert_sdpa_matches_reference(fallback, q, k, v)
+
     # Installing again returns at the flag check, before the info log.
     infos = []
     monkeypatch.setattr("vllm_torchtpu.omni.patches.logger.info", infos.append)
     _patch_sdpa_fallback_dispatch()
     assert infos == []
     assert SDPAImpl.forward is TpuSDPAImpl.forward
+
+
+def test_sdpa_fallback_keeps_upstream_forward_oot(monkeypatch):
+    # vLLM-Omni with SDPAImpl.forward_oot dispatches TPU calls itself; the
+    # patch leaves it alone.
+    monkeypatch.setattr(SDPAImpl, "forward", _UPSTREAM_SDPA_FORWARD)
+    upstream_oot = SDPAImpl.__dict__.get("forward_oot")
+    if upstream_oot is None:
+        pytest.skip("this vLLM-Omni has no SDPAImpl.forward_oot")
+    _patch_sdpa_fallback_dispatch()
+    assert SDPAImpl.forward is _UPSTREAM_SDPA_FORWARD
+    fallback = SDPAImpl(num_heads=2, head_size=8, softmax_scale=0.3)
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(2, 5, 2, 8) for _ in range(3))
+    _assert_sdpa_matches_reference(fallback, q, k, v)
 
 
 @pytest.fixture

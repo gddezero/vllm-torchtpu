@@ -404,15 +404,17 @@ _SDPA_FALLBACK_PATCHED = "_tpu_sdpa_fallback_patched"
 
 def _patch_sdpa_fallback_dispatch() -> None:
     # -------------------------------------------------------------------------
-    # TODO: Remove once vLLM-Omni's AttentionImpl.forward dispatches
-    # out-of-tree platforms instead of raising NotImplementedError.
+    # TODO: Remove once the pinned vLLM-Omni gives SDPAImpl its own forward_oot
+    # (gddezero/vllm-omni fasth3-omni has it since 0a1653d58).
     #
     # Problem: Attention builds `sdpa_fallback` from vLLM-Omni's SDPAImpl,
-    #   whatever the selected backend. AttentionImpl.forward picks
-    #   forward_cuda/_npu/... from the platform and raises NotImplementedError
-    #   on TPU, so every sdpa_fallback call fails there.
-    # Fix: SDPAImpl.forward is replaced by TpuSDPAImpl.forward, which runs
-    #   SDPAImpl._forward_impl with broadcast key masks, as forward_cuda does.
+    #   whatever the selected backend. Without SDPAImpl.forward_oot,
+    #   AttentionImpl.forward reaches the default forward_oot on TPU and raises
+    #   NotImplementedError, so every sdpa_fallback call fails there.
+    # Fix: where SDPAImpl has no forward_oot of its own, SDPAImpl.forward is
+    #   replaced by TpuSDPAImpl.forward, which runs SDPAImpl._forward_impl with
+    #   broadcast key masks, as forward_cuda does. Where it has one, upstream
+    #   dispatch is left alone.
     # Effect: sdpa_fallback calls run on TPU instead of raising
     #   NotImplementedError. LTX-2's _LTX2ParallelAttention sends masked calls
     #   to sdpa_fallback: with sequence parallelism the audio latents are
@@ -425,6 +427,8 @@ def _patch_sdpa_fallback_dispatch() -> None:
     from vllm_torchtpu.omni.attention import TpuSDPAImpl
 
     if getattr(SDPAImpl.forward, _SDPA_FALLBACK_PATCHED, False):
+        return
+    if "forward_oot" in SDPAImpl.__dict__:
         return
     # The flag lands on TpuSDPAImpl.forward, the function shared by both classes.
     setattr(TpuSDPAImpl.forward, _SDPA_FALLBACK_PATCHED, True)
