@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import importlib.util
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -94,6 +95,11 @@ def test_platform_attributes():
     assert platform.dist_backend == "gloo"
     assert platform.supports_torch_inductor() is False
     assert platform.supports_diffusion_dense_flash_attention() is False
+    # Offload is enabled only with a vLLM-Omni that moves tensors across devices.
+    moves_across_devices = (
+        importlib.util.find_spec("vllm_omni.diffusion.utils.tensor_move") is not None
+    )
+    assert platform.supports_cpu_offload() is moves_across_devices
     assert (
         platform.get_diffusion_attn_backend_cls(None, 64)
         == "vllm_torchtpu.omni.attention.TpuFlashAttentionBackend"
@@ -264,11 +270,6 @@ def test_wan_ffn_gelu_fence(monkeypatch):
 
 def test_device_control_env_var():
     assert OmniTpuPlatform.device_control_env_var == "TPU_VISIBLE_CHIPS"
-
-
-def test_cpu_offload_is_supported():
-    # vLLM-Omni's offloader skips every offload strategy when this is False.
-    assert OmniTpuPlatform.supports_cpu_offload()
 
 
 def test_shared_slicebuilder_addresses(monkeypatch):

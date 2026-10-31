@@ -13,6 +13,7 @@
 # limitations under the License.
 """TPU platform plugin for vllm-omni."""
 
+import importlib.util
 import os
 from collections.abc import Callable
 
@@ -153,11 +154,13 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     @classmethod
     def supports_cpu_offload(cls) -> bool:
-        # Model-level offload (--enable-cpu-offload) runs on TPU: pinned host
-        # memory works, and vLLM-Omni moves parameters across device types
-        # in place. Verified with FastH3 Omni on v6e-8 (text encoder and
-        # VAEs on the host during denoising).
-        return True
+        # Model-level offload (--enable-cpu-offload) needs a vLLM-Omni that
+        # moves parameters across CPU and TPU in place (assigning .data across
+        # the two raises "incompatible tensor type"); gddezero/vllm-omni
+        # fasth3-omni added it with vllm_omni.diffusion.utils.tensor_move.
+        # Without it, keep vLLM-Omni's warn-and-skip path. Layer-wise offload
+        # is not verified on TPU.
+        return importlib.util.find_spec("vllm_omni.diffusion.utils.tensor_move") is not None
 
     @classmethod
     def set_device(cls, device: torch.device | int) -> None:
