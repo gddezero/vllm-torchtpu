@@ -1069,3 +1069,42 @@ def test_block_sparse_attention_op_on_tpu():
         *(x.transpose(1, 2).float() for x in (q, k, v)), attn_mask=mask
     ).transpose(1, 2)
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+def test_fp32_matmul_highest_wrapper(monkeypatch):
+    # The wrapped forward must run inside torch.tpu.precision(HIGHEST), and
+    # wrapping twice must not nest a second context.
+    from contextlib import contextmanager
+
+    from vllm_torchtpu.omni import patches
+
+    seen = []
+
+    @contextmanager
+    def _record(precision):
+        seen.append(precision)
+        yield
+
+    monkeypatch.setattr(torch.tpu, "precision", _record)
+
+    class _Mod(torch.nn.Module):
+        def forward(self, x):
+            return x + len(seen)
+
+    patches._wrap_fp32_matmul_highest(_Mod)
+    patches._wrap_fp32_matmul_highest(_Mod)
+    assert _Mod()(torch.zeros(1)).item() == 1
+    assert seen == [torch.tpu.Precision.HIGHEST]
+
+
+def test_minimax_h3_fp32_matmul_precision_patch():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3DiTModel,
+        MiniMaxH3TimeEmbedder,
+    )
+
+    from vllm_torchtpu.omni import patches
+
+    patches._patch_minimax_h3_fp32_matmul_precision()
+    for cls in (MiniMaxH3DiTModel, MiniMaxH3TimeEmbedder):
+        assert getattr(cls.forward, patches._FP32_HIGHEST_PATCHED, False)
