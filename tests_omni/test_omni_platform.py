@@ -266,6 +266,11 @@ def test_device_control_env_var():
     assert OmniTpuPlatform.device_control_env_var == "TPU_VISIBLE_CHIPS"
 
 
+def test_cpu_offload_is_supported():
+    # vLLM-Omni's offloader skips every offload strategy when this is False.
+    assert OmniTpuPlatform.supports_cpu_offload()
+
+
 def test_shared_slicebuilder_addresses(monkeypatch):
     # Every worker derives the same list from the shared MASTER_PORT.
     monkeypatch.setenv("MASTER_PORT", "29500")

@@ -153,7 +153,11 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     @classmethod
     def supports_cpu_offload(cls) -> bool:
-        return False
+        # Model-level offload (--enable-cpu-offload) runs on TPU: pinned host
+        # memory works, and vLLM-Omni moves parameters across device types
+        # in place. Verified with FastH3 Omni on v6e-8 (text encoder and
+        # VAEs on the host during denoising).
+        return True
 
     @classmethod
     def set_device(cls, device: torch.device | int) -> None:
