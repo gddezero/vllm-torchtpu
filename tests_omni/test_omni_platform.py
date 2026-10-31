@@ -601,6 +601,24 @@ def test_sdpa_fallback_keeps_upstream_forward_oot(monkeypatch):
     q, k, v = (torch.randn(2, 5, 2, 8) for _ in range(3))
     _assert_sdpa_matches_reference(fallback, q, k, v)
 
+
+@pytest.fixture
+def output_loop_calls(monkeypatch):
+    """Replaces the upstream WorkerProc._async_output_loop with a recorder.
+
+    The upstream loop serves its output queue until shutdown; the recorder
+    keeps only what the patch changes, the gpu_id the loop reads.
+    """
+    calls = []
+
+    def _async_output_loop(self):
+        calls.append((self.gpu_id, self.queue))
+
+    monkeypatch.setattr(WorkerProc, "_async_output_loop", _async_output_loop)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 1)
+    return calls
+
+
 def _make_worker_proc(gpu_id):
     worker = object.__new__(WorkerProc)  # skips __init__, which builds the worker
     worker.gpu_id = gpu_id
