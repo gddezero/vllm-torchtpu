@@ -174,13 +174,6 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
             cls._set_shared_slicebuilder_addresses(world_size)
             cls._offload_dense_all_to_all()
         cls._prepare_singlehost_tpu_env(world_size)
-        # torch_tpu runs float32 matmuls as one bf16 MXU pass by default, while
-        # PyTorch on CUDA computes them in full float32. Diffusion models keep
-        # some layers in float32 on purpose (MiniMax H3: latent embedders, time
-        # embedding, video/audio output heads); with the default, FastH3 Omni's
-        # audio output on TPU was 2.06x the bf16 noise floor against a CPU fp32
-        # reference, and 0.91x with "highest". bf16 matmuls are unaffected.
-        torch.set_float32_matmul_precision("highest")
         torch.accelerator.set_device_index(0)
         _ = torch.empty(1, device=torch.device("tpu"))
         torch.accelerator.synchronize()

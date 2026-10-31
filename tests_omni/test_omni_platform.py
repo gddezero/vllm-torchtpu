@@ -318,26 +318,6 @@ def test_dist_backend_after_world_size_pop(monkeypatch):
     assert OmniTpuPlatform().dist_backend == "tpu_dist"
 
 
-def test_set_device_sets_fp32_matmul_precision_highest(monkeypatch):
-    # float32 matmuls must run in full precision, as on CUDA (torch_tpu
-    # defaults to a single bf16 pass).
-    monkeypatch.delenv("WORLD_SIZE", raising=False)
-    monkeypatch.setattr(
-        OmniTpuPlatform,
-        "_prepare_singlehost_tpu_env",
-        staticmethod(lambda world_size: None),
-    )
-    monkeypatch.setattr(torch, "accelerator", MagicMock(), raising=False)
-    previous = torch.get_float32_matmul_precision()
-    torch.set_float32_matmul_precision("medium")
-    try:
-        with patch("torch.empty"), patch("torch.device"):
-            OmniTpuPlatform.set_device(None)
-        assert torch.get_float32_matmul_precision() == "highest"
-    finally:
-        torch.set_float32_matmul_precision(previous)
-
-
 @pytest.mark.parametrize("chips, warns", [(None, False), ("0,1", False), ("1,2", True)])
 def test_set_device_warns_on_pinned_multi_rank_stage(monkeypatch, chips, warns):
     # Ranks bind chips 0..N-1 by local rank, so a stage pinned to other chips
@@ -1062,3 +1042,42 @@ def test_block_sparse_attention_op_on_tpu():
         *(x.transpose(1, 2).float() for x in (q, k, v)), attn_mask=mask
     ).transpose(1, 2)
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+def test_fp32_matmul_highest_wrapper(monkeypatch):
+    # The wrapped forward must run inside torch.tpu.precision(HIGHEST), and
+    # wrapping twice must not nest a second context.
+    from contextlib import contextmanager
+
+    from vllm_torchtpu.omni import patches
+
+    seen = []
+
+    @contextmanager
+    def _record(precision):
+        seen.append(precision)
+        yield
+
+    monkeypatch.setattr(torch.tpu, "precision", _record)
+
+    class _Mod(torch.nn.Module):
+        def forward(self, x):
+            return x + len(seen)
+
+    patches._wrap_fp32_matmul_highest(_Mod)
+    patches._wrap_fp32_matmul_highest(_Mod)
+    assert _Mod()(torch.zeros(1)).item() == 1
+    assert seen == [torch.tpu.Precision.HIGHEST]
+
+
+def test_minimax_h3_fp32_matmul_precision_patch():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3DiTModel,
+        MiniMaxH3TimeEmbedder,
+    )
+
+    from vllm_torchtpu.omni import patches
+
+    patches._patch_minimax_h3_fp32_matmul_precision()
+    for cls in (MiniMaxH3DiTModel, MiniMaxH3TimeEmbedder):
+        assert getattr(cls.forward, patches._FP32_HIGHEST_PATCHED, False)
