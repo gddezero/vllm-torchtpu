@@ -549,14 +549,14 @@ def test_wan_self_attention_patch_falls_back_on_f32():
 
 
 def test_sdpa_fallback_routes_to_tpu_sdpa(monkeypatch):
-    # Upstream AttentionImpl.forward raises on out-of-tree platforms; after
-    # the patch, sdpa_fallback (a plain SDPAImpl) runs PyTorch SDPA.
+    # Older vLLM-Omni raises NotImplementedError from AttentionImpl.forward on
+    # out-of-tree platforms; newer vLLM-Omni gives SDPAImpl a forward_oot.
+    # Either way, after the patch sdpa_fallback (a plain SDPAImpl) runs
+    # TpuSDPAImpl.forward.
     monkeypatch.setattr(SDPAImpl, "forward", _UPSTREAM_SDPA_FORWARD)
     fallback = SDPAImpl(num_heads=2, head_size=8, softmax_scale=0.3)
     torch.manual_seed(0)
     q, k, v = (torch.randn(2, 5, 2, 8) for _ in range(3))
-    with pytest.raises(NotImplementedError):
-        fallback.forward(q, k, v)
 
     _patch_sdpa_fallback_dispatch()
     assert getattr(SDPAImpl.forward, _SDPA_FALLBACK_PATCHED, False)
