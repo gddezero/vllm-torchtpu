@@ -84,6 +84,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_fresh_timestep()
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
+    _patch_minimax_h3_fp32_matmul_precision()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -404,15 +405,17 @@ _SDPA_FALLBACK_PATCHED = "_tpu_sdpa_fallback_patched"
 
 def _patch_sdpa_fallback_dispatch() -> None:
     # -------------------------------------------------------------------------
-    # TODO: Remove once vLLM-Omni's AttentionImpl.forward dispatches
-    # out-of-tree platforms instead of raising NotImplementedError.
+    # TODO: Remove once the pinned vLLM-Omni gives SDPAImpl its own forward_oot
+    # (gddezero/vllm-omni fasth3-omni has it since 0a1653d58).
     #
     # Problem: Attention builds `sdpa_fallback` from vLLM-Omni's SDPAImpl,
-    #   whatever the selected backend. AttentionImpl.forward picks
-    #   forward_cuda/_npu/... from the platform and raises NotImplementedError
-    #   on TPU, so every sdpa_fallback call fails there.
-    # Fix: SDPAImpl.forward is replaced by TpuSDPAImpl.forward, which runs
-    #   SDPAImpl._forward_impl with broadcast key masks, as forward_cuda does.
+    #   whatever the selected backend. Without SDPAImpl.forward_oot,
+    #   AttentionImpl.forward reaches the default forward_oot on TPU and raises
+    #   NotImplementedError, so every sdpa_fallback call fails there.
+    # Fix: where SDPAImpl has no forward_oot of its own, SDPAImpl.forward is
+    #   replaced by TpuSDPAImpl.forward, which runs SDPAImpl._forward_impl with
+    #   broadcast key masks, as forward_cuda does. Where it has one, upstream
+    #   dispatch is left alone.
     # Effect: sdpa_fallback calls run on TPU instead of raising
     #   NotImplementedError. LTX-2's _LTX2ParallelAttention sends masked calls
     #   to sdpa_fallback: with sequence parallelism the audio latents are
@@ -425,6 +428,8 @@ def _patch_sdpa_fallback_dispatch() -> None:
     from vllm_torchtpu.omni.attention import TpuSDPAImpl
 
     if getattr(SDPAImpl.forward, _SDPA_FALLBACK_PATCHED, False):
+        return
+    if "forward_oot" in SDPAImpl.__dict__:
         return
     # The flag lands on TpuSDPAImpl.forward, the function shared by both classes.
     setattr(TpuSDPAImpl.forward, _SDPA_FALLBACK_PATCHED, True)
@@ -645,3 +650,48 @@ def _patch_ltx2_split_rope() -> None:
     rope_cls.forward = _cached_rope_forward
     ltx2_transformer.apply_split_rotary_emb = _apply_split_rotary_emb
     logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
+
+
+_FP32_HIGHEST_PATCHED = "_tpu_fp32_highest_patched"
+
+
+def _patch_minimax_h3_fp32_matmul_precision() -> None:
+    # MiniMax H3: run the DiT's float32 matmuls in full float32.
+    #
+    # Problem: torch_tpu runs a float32 matmul as one bf16 MXU pass unless the
+    #   precision is raised; CUDA computes it in full float32. H3 keeps its
+    #   patch projections, time embedder and output heads in float32
+    #   (MINIMAX_H3_FP32_PARAM_NAMES), so on TPU they lost float32 precision.
+    # Fix: run MiniMaxH3DiTModel.forward under HIGHEST. Everything else in the
+    #   DiT is bf16, which the setting does not touch. MiniMaxH3TimeEmbedder is
+    #   wrapped too because the AdaLN cache builder calls it outside the DiT
+    #   forward. The VAE and text encoder keep the default: the reference VAE
+    #   decode is not full float32 either (it runs under fp16 autocast).
+    # Effect (v6e, FastH3 Omni, 2 DiT blocks, one denoise step, rel_L2 to a
+    #   CPU float32 reference in units of the CPU bf16 noise floor): video
+    #   1.41x -> 0.85x, audio 2.06x -> 0.91x. Measured with the precision set
+    #   process-wide; this patch scopes it to the DiT.
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3DiTModel,
+        MiniMaxH3TimeEmbedder,
+    )
+
+    for cls in (MiniMaxH3DiTModel, MiniMaxH3TimeEmbedder):
+        _wrap_fp32_matmul_highest(cls)
+    logger.info(
+        "Applied TPU patch: float32 matmul precision HIGHEST in "
+        "MiniMaxH3DiTModel and MiniMaxH3TimeEmbedder."
+    )
+
+
+def _wrap_fp32_matmul_highest(cls: type) -> None:
+    if getattr(cls.forward, _FP32_HIGHEST_PATCHED, False):
+        return
+    forward = cls.forward
+
+    def _fp32_highest_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
+        with torch.tpu.precision(torch.tpu.Precision.HIGHEST):
+            return forward(self, *args, **kwargs)
+
+    setattr(_fp32_highest_forward, _FP32_HIGHEST_PATCHED, True)
+    cls.forward = _fp32_highest_forward
