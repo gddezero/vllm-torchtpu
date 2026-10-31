@@ -34,6 +34,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -48,6 +49,7 @@ pytestmark = [
 
 WORLD_SIZE = 8
 LAUNCH_TIMEOUT_SECONDS = 600
+EXIT_GRACE_SECONDS = 120
 SOURCE = [42, -7, 2**40 + 5]
 
 
@@ -116,12 +118,23 @@ def _run_worker(result_dir: Path, arm: str) -> None:
             result["all_gather"] = gathered.cpu().tolist()
             payload: list[dict[str, int] | None] = [{"a": 1} if rank == 0 else None]
             dist.broadcast_object_list(payload, src=0)
+            # Under DEFER_AND_FUSE the source rank's sends stay queued until it
+            # next synchronizes; it reads nothing back here, so without this
+            # the receivers wait forever while rank 0 waits for their results.
+            torch.accelerator.synchronize()
             result["object"] = payload[0]
     except BaseException:
         result["error"] = traceback.format_exc()[-4000:]
     (result_dir / f"rank_{rank}.json").write_text(json.dumps(result), encoding="utf-8")
-    # Skip process-group teardown: with corrupted collectives in flight (the
-    # control arm) the source rank can hang there, and the result is written.
+    # Leave only once every rank has written its result (or after a grace
+    # period): a source rank that exits as soon as its own broadcast returns
+    # strands the others mid-collective. Exit without process-group teardown,
+    # which can hang after the control arm's corrupted collectives.
+    deadline = time.monotonic() + EXIT_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        if all((result_dir / f"rank_{r}.json").exists() for r in range(world)):
+            break
+        time.sleep(1)
     os._exit(0)
 
 
@@ -184,9 +197,13 @@ def assert_fixed(results: list[dict]) -> None:
 
 
 def check_control_corrupts(results: list[dict]) -> None:
-    errors = [r for r in results if "error" in r]
+    # Only the receiving ranks are judged. In the corrupted state the source
+    # rank can hang reading back its own tensor (seen on v6e-8), so its result
+    # may be missing.
+    receivers = results[1:]
+    errors = [r for r in receivers if "error" in r]
     assert not errors, f"worker failures: {errors}"
-    if all(r["broadcast"] == SOURCE for r in results):
+    if all(r["broadcast"] == SOURCE for r in receivers):
         pytest.skip(
             "positive control did not reproduce the int64 corruption here; the "
             "fixed arm alone does not show the workaround is needed on this "
