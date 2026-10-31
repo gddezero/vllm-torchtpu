@@ -324,6 +324,28 @@ def test_dist_backend_after_world_size_pop(monkeypatch):
     assert OmniTpuPlatform().dist_backend == "tpu_dist"
 
 
+@pytest.mark.parametrize("world_size, expected", [("2", "true"), ("1", "false")])
+def test_set_device_materializes_collective_tensors(monkeypatch, world_size, expected):
+    # Multi-rank diffusion workers run collectives under DEFER_AND_FUSE, where
+    # the process-wide "false" corrupts int64 collectives.
+    monkeypatch.setenv("WORLD_SIZE", world_size)
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "localhost:1")
+    monkeypatch.setenv("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
+    # set_device also appends a libtpu flag; restore it after the test.
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", "")
+    monkeypatch.setattr(OmniTpuPlatform, "_worker_world_size", 1)
+    monkeypatch.setattr(
+        OmniTpuPlatform,
+        "_prepare_singlehost_tpu_env",
+        staticmethod(lambda world_size: None),
+    )
+    monkeypatch.setattr(torch, "accelerator", MagicMock(), raising=False)
+    with patch("torch.empty"), patch("torch.device"):
+        OmniTpuPlatform.set_device(None)
+    assert os.environ["TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS"] == expected
+
+
 @pytest.mark.parametrize("chips, warns", [(None, False), ("0,1", False), ("1,2", True)])
 def test_set_device_warns_on_pinned_multi_rank_stage(monkeypatch, chips, warns):
     # Ranks bind chips 0..N-1 by local rank, so a stage pinned to other chips

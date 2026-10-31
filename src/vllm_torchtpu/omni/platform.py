@@ -180,10 +180,39 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
                 )
             cls._set_shared_slicebuilder_addresses(world_size)
             cls._offload_dense_all_to_all()
+            cls._materialize_collective_inputs()
         cls._prepare_singlehost_tpu_env(world_size)
         torch.accelerator.set_device_index(0)
         _ = torch.empty(1, device=torch.device("tpu"))
         torch.accelerator.synchronize()
+
+    @staticmethod
+    def _materialize_collective_inputs() -> None:
+        """Let torch_tpu materialize eager collective tensors in diffusion workers.
+
+        vllm-torchtpu turns TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS
+        off process-wide (sitecustomize.py) so that c10d functional
+        collectives do not break vLLM's compiled TP graphs. Diffusion workers
+        run eager under DEFER_AND_FUSE (set by
+        TpuPlatform.check_and_update_config while their VllmConfig is built;
+        supports_torch_inductor() is False, so vLLM-Omni does not compile the
+        DiT here), and there that setting corrupts eager collectives: an
+        int64 broadcast reaches the other ranks as garbage, so
+        torch.distributed.broadcast_object_list fails to unpickle ("Ran out
+        of input") and int64 metadata such as shapes or token ids arrives
+        wrong. Measured on v6e-8 (tests_omni/test_omni_collectives_multichip.py);
+        bf16, f32 and int32 broadcasts were unaffected there.
+
+        The import-time effect that sitecustomize.py describes (the Dynamo
+        graph-break marking) stays as set at import. For eager collectives,
+        setting the variable here, after torch_tpu is imported but before the
+        process group is created, takes effect: measured on v6e-8 with a
+        torchrun probe that changed it at this point.
+        """
+        # TODO: Remove once torch_tpu materializes deferred collective inputs
+        # with this setting off (the control arm of the multichip test then
+        # stops corrupting).
+        os.environ["TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS"] = "true"
 
     @staticmethod
     def _offload_dense_all_to_all() -> None:

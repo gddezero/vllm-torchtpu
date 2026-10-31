@@ -47,6 +47,9 @@ os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 # Dynamo Unsupported crash during vLLM startup (fullgraph=True). Setting
 # this to false allows functional collectives to compile under SPMD, which
 # is safe and required for Tensor Parallelism.
+# Multi-rank diffusion workers set this back to "true" before creating their
+# process group: they run eager under DEFER_AND_FUSE, where "false" corrupts
+# int64 collectives (OmniTpuPlatform._materialize_collective_inputs).
 os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
 
 # vLLM 0.27.0 auto-enables breakable cudagraph for Kimi K3, disabling its
